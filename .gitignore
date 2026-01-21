@@ -42,3 +42,5 @@ coverage.html
 # Temporary files
 tmp/
 temp/
+
+config.yaml
