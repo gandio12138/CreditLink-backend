@@ -131,3 +131,13 @@ func (r *UserRepository) List(ctx context.Context, offset, limit int) ([]models.
 
 	return users, total, nil
 }
+
+// CountActiveUsers 统计活跃用户数量（有过交易记录的用户）
+func (r *UserRepository) CountActiveUsers(ctx context.Context) (int64, error) {
+	var count int64
+	err := r.db.WithContext(ctx).
+		Model(&models.User{}).
+		Where("id IN (SELECT DISTINCT user_id FROM loan_activities)").
+		Count(&count).Error
+	return count, err
+}

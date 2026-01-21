@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/creditlink/backend/internal/models"
@@ -34,6 +35,7 @@ type Config struct {
 	StartBlock     uint64
 	BlockBatchSize uint64
 	PollInterval   time.Duration
+	RPCRateLimit   int // requests per second, 0 = no limit
 }
 
 // Indexer indexes on-chain events
@@ -43,10 +45,19 @@ type Indexer struct {
 	startBlock   uint64
 	batchSize    uint64
 	pollInterval time.Duration
+	rpcRateLimit int
 
 	userRepo     *repository.UserRepository
 	activityRepo *repository.ActivityRepository
 	riskRepo     *repository.RiskRepository
+
+	// Block timestamp cache to reduce RPC calls
+	blockCache     map[uint64]time.Time
+	blockCacheMu   sync.RWMutex
+
+	// Rate limiter
+	lastRPCCall    time.Time
+	rpcCallMu      sync.Mutex
 }
 
 // NewIndexer creates a new indexer
@@ -63,12 +74,17 @@ func NewIndexer(
 
 	batchSize := cfg.BlockBatchSize
 	if batchSize == 0 {
-		batchSize = 1000
+		batchSize = 100 // Reduced default batch size to avoid rate limiting
 	}
 
 	pollInterval := cfg.PollInterval
 	if pollInterval == 0 {
-		pollInterval = 12 * time.Second
+		pollInterval = 15 * time.Second // Increased poll interval
+	}
+
+	rpcRateLimit := cfg.RPCRateLimit
+	if rpcRateLimit == 0 {
+		rpcRateLimit = 5 // Default: 5 requests per second
 	}
 
 	return &Indexer{
@@ -77,10 +93,68 @@ func NewIndexer(
 		startBlock:   cfg.StartBlock,
 		batchSize:    batchSize,
 		pollInterval: pollInterval,
+		rpcRateLimit: rpcRateLimit,
 		userRepo:     userRepo,
 		activityRepo: activityRepo,
 		riskRepo:     riskRepo,
+		blockCache:   make(map[uint64]time.Time),
 	}, nil
+}
+
+// rateLimitWait waits if necessary to respect the rate limit
+func (i *Indexer) rateLimitWait() {
+	if i.rpcRateLimit <= 0 {
+		return
+	}
+
+	i.rpcCallMu.Lock()
+	defer i.rpcCallMu.Unlock()
+
+	minInterval := time.Second / time.Duration(i.rpcRateLimit)
+	elapsed := time.Since(i.lastRPCCall)
+	if elapsed < minInterval {
+		time.Sleep(minInterval - elapsed)
+	}
+	i.lastRPCCall = time.Now()
+}
+
+// getBlockTimestamp gets block timestamp with caching
+func (i *Indexer) getBlockTimestamp(ctx context.Context, blockNumber uint64) (time.Time, error) {
+	// Check cache first
+	i.blockCacheMu.RLock()
+	if ts, ok := i.blockCache[blockNumber]; ok {
+		i.blockCacheMu.RUnlock()
+		return ts, nil
+	}
+	i.blockCacheMu.RUnlock()
+
+	// Fetch from chain with rate limiting
+	i.rateLimitWait()
+	block, err := i.client.BlockByNumber(ctx, big.NewInt(int64(blockNumber)))
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	ts := time.Unix(int64(block.Time()), 0)
+
+	// Cache the result
+	i.blockCacheMu.Lock()
+	i.blockCache[blockNumber] = ts
+	// Limit cache size to 1000 entries
+	if len(i.blockCache) > 1000 {
+		// Simple eviction: clear half the cache
+		count := 0
+		for k := range i.blockCache {
+			if count > 500 {
+				break
+			}
+			delete(i.blockCache, k)
+			count++
+		}
+	}
+	i.blockCacheMu.Unlock()
+
+	return ts, nil
 }
 
 // Start starts the indexer
@@ -113,12 +187,17 @@ func (i *Indexer) Start(ctx context.Context) error {
 
 // indexHistorical indexes historical blocks
 func (i *Indexer) indexHistorical(ctx context.Context, fromBlock uint64) error {
+	i.rateLimitWait()
 	latestBlock, err := i.client.BlockNumber(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get latest block: %w", err)
 	}
 
 	log.Printf("Indexing historical blocks from %d to %d", fromBlock, latestBlock)
+
+	retryCount := 0
+	maxRetries := 5
+	baseBackoff := time.Second
 
 	for currentBlock := fromBlock; currentBlock <= latestBlock; currentBlock += i.batchSize {
 		select {
@@ -132,15 +211,40 @@ func (i *Indexer) indexHistorical(ctx context.Context, fromBlock uint64) error {
 			toBlock = latestBlock
 		}
 
-		if err := i.indexBlockRange(ctx, currentBlock, toBlock); err != nil {
+		err := i.indexBlockRange(ctx, currentBlock, toBlock)
+		if err != nil {
+			// Check if it's a rate limit error
+			if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "Too Many Requests") {
+				retryCount++
+				if retryCount > maxRetries {
+					log.Printf("Max retries exceeded for blocks %d-%d, skipping", currentBlock, toBlock)
+					retryCount = 0
+					continue
+				}
+				// Exponential backoff
+				backoff := baseBackoff * time.Duration(1<<uint(retryCount))
+				if backoff > 60*time.Second {
+					backoff = 60 * time.Second
+				}
+				log.Printf("Rate limited, waiting %v before retry (attempt %d/%d)", backoff, retryCount, maxRetries)
+				time.Sleep(backoff)
+				currentBlock -= i.batchSize // Retry the same block range
+				continue
+			}
 			log.Printf("Error indexing blocks %d-%d: %v", currentBlock, toBlock, err)
 			continue
 		}
+
+		// Reset retry count on success
+		retryCount = 0
 
 		// Save progress
 		if err := i.saveProgress(ctx, toBlock); err != nil {
 			log.Printf("Error saving progress: %v", err)
 		}
+
+		// Add a small delay between batches to avoid rate limiting
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	log.Println("Historical indexing complete")
@@ -153,12 +257,16 @@ func (i *Indexer) watchNewBlocks(ctx context.Context) error {
 	defer ticker.Stop()
 
 	var lastBlock uint64
+	retryCount := 0
+	maxRetries := 5
+	baseBackoff := time.Second
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			i.rateLimitWait()
 			latestBlock, err := i.client.BlockNumber(ctx)
 			if err != nil {
 				log.Printf("Error getting latest block: %v", err)
@@ -173,10 +281,32 @@ func (i *Indexer) watchNewBlocks(ctx context.Context) error {
 			}
 
 			if latestBlock > lastBlock {
-				if err := i.indexBlockRange(ctx, lastBlock+1, latestBlock); err != nil {
+				err := i.indexBlockRange(ctx, lastBlock+1, latestBlock)
+				if err != nil {
+					// Check if it's a rate limit error
+					if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "Too Many Requests") {
+						retryCount++
+						if retryCount <= maxRetries {
+							backoff := baseBackoff * time.Duration(1<<uint(retryCount))
+							if backoff > 60*time.Second {
+								backoff = 60 * time.Second
+							}
+							log.Printf("Rate limited in real-time indexing, waiting %v (attempt %d/%d)", backoff, retryCount, maxRetries)
+							time.Sleep(backoff)
+						} else {
+							log.Printf("Max retries exceeded, skipping blocks %d-%d", lastBlock+1, latestBlock)
+							lastBlock = latestBlock // Skip these blocks to avoid getting stuck
+							retryCount = 0
+						}
+						continue
+					}
 					log.Printf("Error indexing blocks %d-%d: %v", lastBlock+1, latestBlock, err)
 					continue
 				}
+
+				// Reset retry count on success
+				retryCount = 0
+
 				if err := i.saveProgress(ctx, latestBlock); err != nil {
 					log.Printf("Error saving progress: %v", err)
 				}
@@ -200,6 +330,9 @@ func (i *Indexer) indexBlockRange(ctx context.Context, fromBlock, toBlock uint64
 			LiquidationEventSig,
 		}},
 	}
+
+	// Rate limit before RPC call
+	i.rateLimitWait()
 
 	logs, err := i.client.FilterLogs(ctx, query)
 	if err != nil {
@@ -346,12 +479,11 @@ func (i *Indexer) saveActivity(
 		return fmt.Errorf("failed to get user: %w", err)
 	}
 
-	// Get block timestamp
-	block, err := i.client.BlockByNumber(ctx, big.NewInt(int64(vLog.BlockNumber)))
+	// Get block timestamp with caching
+	blockTime, err := i.getBlockTimestamp(ctx, vLog.BlockNumber)
 	if err != nil {
-		return fmt.Errorf("failed to get block: %w", err)
+		return fmt.Errorf("failed to get block timestamp: %w", err)
 	}
-	blockTime := time.Unix(int64(block.Time()), 0)
 
 	activity := &models.LoanActivity{
 		UserID:         userModel.ID,

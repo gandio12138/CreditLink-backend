@@ -41,6 +41,11 @@ func SetupRoutes(r *gin.Engine, deps *Dependencies) {
 		v1.GET("/risk/params", riskHandler.GetRiskParams)           // 获取所有风险参数
 		v1.GET("/risk/params/:asset", riskHandler.GetAssetRiskParams) // 获取特定资产风险参数
 
+		// 统计接口 (公开)
+		statsHandler := handlers.NewStatsHandler(deps.ActivityRepo, deps.UserRepo, deps.RiskRepo)
+		v1.GET("/stats/platform", statsHandler.GetPlatformStats) // 获取平台统计
+		v1.GET("/stats/markets", statsHandler.GetMarketsData)    // 获取市场数据
+
 		// 受保护路由 (需要JWT认证)
 		protected := v1.Group("")
 		protected.Use(middleware.JWTAuth())

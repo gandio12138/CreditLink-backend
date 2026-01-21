@@ -3,6 +3,8 @@ package repository
 import (
 	"context"
 	"errors"
+	"log"
+	"math/big"
 	"strings"
 	"time"
 
@@ -170,4 +172,37 @@ func (r *ActivityRepository) GetActivitiesByBlockRange(ctx context.Context, star
 		return nil, err
 	}
 	return activities, nil
+}
+
+// AssetTotal 资产统计结果
+type AssetTotal struct {
+	AssetAddress string `gorm:"column:asset_address"`
+	TotalAmount  string `gorm:"column:total_amount"`
+}
+
+// GetTotalsByActionType 按操作类型统计各资产的总量
+func (r *ActivityRepository) GetTotalsByActionType(ctx context.Context, actionType string) (map[string]*big.Int, error) {
+	var results []AssetTotal
+	err := r.db.WithContext(ctx).
+		Model(&models.LoanActivity{}).
+		Select("asset_address, SUM(amount) as total_amount").
+		Where("action_type = ?", actionType).
+		Group("asset_address").
+		Scan(&results).Error
+	if err != nil {
+		log.Printf("[DEBUG] GetTotalsByActionType %s error: %v", actionType, err)
+		return nil, err
+	}
+	log.Printf("[DEBUG] GetTotalsByActionType %s results count: %d", actionType, len(results))
+	for _, res := range results {
+		log.Printf("[DEBUG] Asset: %s, TotalAmount: %s", res.AssetAddress, res.TotalAmount)
+	}
+
+	totals := make(map[string]*big.Int)
+	for _, res := range results {
+		amount := new(big.Int)
+		amount.SetString(res.TotalAmount, 10)
+		totals[res.AssetAddress] = amount
+	}
+	return totals, nil
 }
