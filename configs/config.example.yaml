@@ -1,0 +1,43 @@
+# 服务器配置
+server:
+  port: "8080"
+  mode: "debug"  # debug | release
+
+# 数据库配置 (PostgreSQL)
+database:
+  host: "localhost"
+  port: 5432
+  user: "postgres"
+  password: "your-password"
+  dbname: "creditlink"
+  max_idle_conns: 10
+  max_open_conns: 100
+  conn_max_lifetime: 60  # minutes
+
+# Redis 配置
+redis:
+  host: "localhost"
+  port: 6379
+  password: ""
+  db: 0
+
+# 区块链配置
+chain:
+  rpc_url: "https://eth-sepolia.g.alchemy.com/v2/your-api-key"
+  chain_id: 11155111
+  lending_pool: "0x..."  # LendingPool 合约地址
+  start_block: 7600000   # 从合约部署后的区块开始
+
+# 签名器配置
+signer:
+  key_provider: "local"  # aws_kms | gcp_kms | local (dev only)
+  private_key: ""        # only for local provider (dev only)
+  kms_key_id: ""
+  signature_ttl: 300     # 签名有效期 (秒)
+  rate_limit_per_user: 5 # 每用户每小时限制
+  rate_limit_per_ip: 20  # 每IP每小时限制
+
+# JWT 配置
+jwt:
+  secret: "your-jwt-secret-key"
+  expire_hour: 24
