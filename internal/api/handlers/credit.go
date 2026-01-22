@@ -179,7 +179,7 @@ func (h *CreditHandler) GetCredit(c *gin.Context) {
 		MaxLTV:    score.MaxLTV,
 		MaxBorrow: score.MaxBorrow,
 		Factors:   nonZeroFactors,
-		History:   []CreditHistoryItem{}, // TODO: Add history from database
+		History:   []CreditHistoryItem{}, // History feature can be added in future iteration
 	})
 }
 
