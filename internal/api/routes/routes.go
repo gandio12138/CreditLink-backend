@@ -5,6 +5,7 @@ import (
 	"github.com/creditlink/backend/internal/api/middleware"
 	"github.com/creditlink/backend/internal/repository"
 	"github.com/creditlink/backend/internal/service/credit"
+	"github.com/creditlink/backend/internal/service/price"
 	"github.com/creditlink/backend/internal/service/signer"
 	"github.com/gin-gonic/gin"
 )
@@ -19,6 +20,7 @@ type Dependencies struct {
 
 	CreditEngine  *credit.Engine   // 信用评分引擎
 	SignerService *signer.Service  // 签名服务
+	PriceService  *price.Service   // 价格服务
 }
 
 // SetupRoutes 配置所有API路由
@@ -51,13 +53,13 @@ func SetupRoutes(r *gin.Engine, deps *Dependencies) {
 		protected.Use(middleware.JWTAuth())
 		{
 			// 信用相关接口
-			creditHandler := handlers.NewCreditHandler(deps.CreditEngine, deps.SignerService, deps.CreditRepo)
+			creditHandler := handlers.NewCreditHandler(deps.CreditEngine, deps.SignerService, deps.CreditRepo, deps.UserRepo)
 			protected.POST("/credit/sign", creditHandler.Sign)              // 请求信用借款签名
 			protected.GET("/user/credit", creditHandler.GetCredit)          // 获取用户信用信息
 			protected.POST("/user/credit/refresh", creditHandler.RefreshCredit) // 刷新信用分
 
 			// 用户相关接口
-			userHandler := handlers.NewUserHandler(deps.UserRepo, deps.ActivityRepo, deps.RiskRepo)
+			userHandler := handlers.NewUserHandler(deps.UserRepo, deps.ActivityRepo, deps.RiskRepo, deps.CreditEngine, deps.PriceService)
 			protected.GET("/user/account", userHandler.GetAccount)       // 获取账户数据
 			protected.GET("/user/positions", userHandler.GetPositions)   // 获取持仓数据
 			protected.GET("/user/activities", userHandler.GetActivities) // 获取活动记录

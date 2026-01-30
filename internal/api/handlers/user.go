@@ -1,9 +1,13 @@
 package handlers
 
 import (
+	"math/big"
 	"net/http"
+	"strings"
 
 	"github.com/creditlink/backend/internal/repository"
+	"github.com/creditlink/backend/internal/service/credit"
+	"github.com/creditlink/backend/internal/service/price"
 	"github.com/gin-gonic/gin"
 )
 
@@ -12,6 +16,8 @@ type UserHandler struct {
 	userRepo     *repository.UserRepository
 	activityRepo *repository.ActivityRepository
 	riskRepo     *repository.RiskRepository
+	creditEngine *credit.Engine
+	priceService *price.Service
 }
 
 // NewUserHandler creates a new user handler
@@ -19,11 +25,15 @@ func NewUserHandler(
 	userRepo *repository.UserRepository,
 	activityRepo *repository.ActivityRepository,
 	riskRepo *repository.RiskRepository,
+	creditEngine *credit.Engine,
+	priceService *price.Service,
 ) *UserHandler {
 	return &UserHandler{
 		userRepo:     userRepo,
 		activityRepo: activityRepo,
 		riskRepo:     riskRepo,
+		creditEngine: creditEngine,
+		priceService: priceService,
 	}
 }
 
@@ -44,9 +54,9 @@ type PositionResponse struct {
 
 // PositionItem represents a single position
 type PositionItem struct {
-	Asset   string `json:"asset"`
-	Symbol  string `json:"symbol"`
-	Amount  string `json:"amount"`
+	Asset    string `json:"asset"`
+	Symbol   string `json:"symbol"`
+	Amount   string `json:"amount"`
 	ValueUSD string `json:"valueUsd"`
 }
 
@@ -55,6 +65,7 @@ type ActivityResponse struct {
 	TxHash     string `json:"txHash"`
 	ActionType string `json:"actionType"`
 	Asset      string `json:"asset"`
+	Symbol     string `json:"symbol"`
 	Amount     string `json:"amount"`
 	Timestamp  int64  `json:"timestamp"`
 }
@@ -94,24 +105,99 @@ func (h *UserHandler) GetAccount(c *gin.Context) {
 		return
 	}
 
-	// Calculate totals (in production, would need price oracle)
-	// For now, return raw values
-	var totalDeposit, totalBorrow string
-	for _, p := range positions {
-		if p.DepositAmount != "0" {
-			totalDeposit = p.DepositAmount
+	// Get all risk params for LTV calculation
+	riskParams, err := h.riskRepo.GetAllRiskParams(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Build risk params map
+	riskParamsMap := make(map[string]*struct {
+		BaseLTV              int
+		LiquidationThreshold int
+	})
+	for i := range riskParams {
+		riskParamsMap[strings.ToLower(riskParams[i].AssetAddress)] = &struct {
+			BaseLTV              int
+			LiquidationThreshold int
+		}{
+			BaseLTV:              riskParams[i].BaseLTV,
+			LiquidationThreshold: riskParams[i].LiquidationThreshold,
 		}
-		if p.BorrowAmount != "0" {
-			totalBorrow = p.BorrowAmount
+	}
+
+	// Calculate totals using price service
+	totalCollateralUSD := big.NewFloat(0)
+	totalDebtUSD := big.NewFloat(0)
+	weightedCollateral := big.NewFloat(0) // Collateral * Liquidation Threshold
+
+	for _, pos := range positions {
+		params := riskParamsMap[strings.ToLower(pos.AssetAddress)]
+
+		// Calculate deposit value
+		depositAmount, _ := new(big.Int).SetString(pos.DepositAmount, 10)
+		if depositAmount != nil && depositAmount.Sign() > 0 {
+			depositUSD := h.priceService.ConvertToUSD(depositAmount, pos.AssetAddress)
+			totalCollateralUSD.Add(totalCollateralUSD, depositUSD)
+
+			// Apply liquidation threshold for health factor
+			if params != nil {
+				threshold := big.NewFloat(float64(params.LiquidationThreshold) / 10000)
+				weighted := new(big.Float).Mul(depositUSD, threshold)
+				weightedCollateral.Add(weightedCollateral, weighted)
+			}
+		}
+
+		// Calculate borrow value
+		borrowAmount, _ := new(big.Int).SetString(pos.BorrowAmount, 10)
+		if borrowAmount != nil && borrowAmount.Sign() > 0 {
+			borrowUSD := h.priceService.ConvertToUSD(borrowAmount, pos.AssetAddress)
+			totalDebtUSD.Add(totalDebtUSD, borrowUSD)
+		}
+	}
+
+	// Calculate health factor: weightedCollateral / totalDebt
+	healthFactor := "0" // 0 means infinite (no debt)
+	if totalDebtUSD.Sign() > 0 {
+		hf := new(big.Float).Quo(weightedCollateral, totalDebtUSD)
+		healthFactor = hf.Text('f', 2)
+	}
+
+	// Calculate current LTV: (totalDebt / totalCollateral) * 10000
+	currentLTV := 0
+	if totalCollateralUSD.Sign() > 0 {
+		ltvFloat := new(big.Float).Quo(totalDebtUSD, totalCollateralUSD)
+		ltvFloat.Mul(ltvFloat, big.NewFloat(10000))
+		ltvInt, _ := ltvFloat.Int64()
+		currentLTV = int(ltvInt)
+	}
+
+	// Get user's max LTV from credit score
+	maxLTV := 7000 // Default 70%
+	if h.creditEngine != nil {
+		score, _, err := h.creditEngine.CalculateScore(c.Request.Context(), wallet)
+		if err == nil && score != nil {
+			maxLTV = score.MaxLTV
+		}
+	}
+
+	// Calculate available borrow: (totalCollateral * maxLTV / 10000) - totalDebt
+	availableBorrowUSD := big.NewFloat(0)
+	if totalCollateralUSD.Sign() > 0 {
+		maxBorrow := new(big.Float).Mul(totalCollateralUSD, big.NewFloat(float64(maxLTV)/10000))
+		availableBorrowUSD = new(big.Float).Sub(maxBorrow, totalDebtUSD)
+		if availableBorrowUSD.Sign() < 0 {
+			availableBorrowUSD = big.NewFloat(0)
 		}
 	}
 
 	c.JSON(http.StatusOK, AccountResponse{
-		TotalCollateralUSD: totalDeposit,
-		TotalDebtUSD:       totalBorrow,
-		AvailableBorrowUSD: "0", // Would need calculation with LTV
-		CurrentLTV:         0,
-		HealthFactor:       "0", // Would need calculation
+		TotalCollateralUSD: price.FormatUSD(totalCollateralUSD),
+		TotalDebtUSD:       price.FormatUSD(totalDebtUSD),
+		AvailableBorrowUSD: price.FormatUSD(availableBorrowUSD),
+		CurrentLTV:         currentLTV,
+		HealthFactor:       healthFactor,
 	})
 }
 
@@ -150,20 +236,32 @@ func (h *UserHandler) GetPositions(c *gin.Context) {
 	borrows := make([]PositionItem, 0)
 
 	for _, p := range positions {
+		symbol := h.priceService.GetSymbol(p.AssetAddress)
+		if symbol == "" {
+			symbol = "UNKNOWN"
+		}
+
 		if p.DepositAmount != "0" {
+			depositAmount, _ := new(big.Int).SetString(p.DepositAmount, 10)
+			valueUSD := h.priceService.ConvertToUSD(depositAmount, p.AssetAddress)
+
 			deposits = append(deposits, PositionItem{
 				Asset:    p.AssetAddress,
-				Symbol:   "", // Would need to look up
+				Symbol:   symbol,
 				Amount:   p.DepositAmount,
-				ValueUSD: "0", // Would need price oracle
+				ValueUSD: price.FormatUSD(valueUSD),
 			})
 		}
+
 		if p.BorrowAmount != "0" {
+			borrowAmount, _ := new(big.Int).SetString(p.BorrowAmount, 10)
+			valueUSD := h.priceService.ConvertToUSD(borrowAmount, p.AssetAddress)
+
 			borrows = append(borrows, PositionItem{
 				Asset:    p.AssetAddress,
-				Symbol:   "",
+				Symbol:   symbol,
 				Amount:   p.BorrowAmount,
-				ValueUSD: "0",
+				ValueUSD: price.FormatUSD(valueUSD),
 			})
 		}
 	}
@@ -204,10 +302,16 @@ func (h *UserHandler) GetActivities(c *gin.Context) {
 
 	result := make([]ActivityResponse, len(activities))
 	for i, a := range activities {
+		symbol := h.priceService.GetSymbol(a.AssetAddress)
+		if symbol == "" {
+			symbol = "UNKNOWN"
+		}
+
 		result[i] = ActivityResponse{
 			TxHash:     a.TxHash,
 			ActionType: string(a.ActionType),
 			Asset:      a.AssetAddress,
+			Symbol:     symbol,
 			Amount:     a.Amount,
 			Timestamp:  a.BlockTimestamp.Unix(),
 		}

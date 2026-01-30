@@ -263,6 +263,25 @@ func (e *Engine) SaveScore(ctx context.Context, walletAddress string, score *Cre
 		return err
 	}
 
+	// 检查是否需要记录历史（分数变化时）
+	var shouldRecordHistory bool
+	var eventType string = "SCORE_CALCULATED"
+
+	oldCredit, err := e.creditRepo.GetByUserID(ctx, user.ID)
+	if err != nil {
+		// 首次计算，记录初始分数
+		shouldRecordHistory = true
+		eventType = "INITIAL_SCORE"
+	} else if oldCredit.Score != score.Score {
+		// 分数变化，记录历史
+		shouldRecordHistory = true
+		if score.Score > oldCredit.Score {
+			eventType = "SCORE_INCREASE"
+		} else {
+			eventType = "SCORE_DECREASE"
+		}
+	}
+
 	// 保存信用分
 	credit := &models.UserCredit{
 		UserID:         user.ID,
@@ -273,6 +292,18 @@ func (e *Engine) SaveScore(ctx context.Context, walletAddress string, score *Cre
 	}
 	if err := e.creditRepo.CreateOrUpdate(ctx, credit); err != nil {
 		return err
+	}
+
+	// 记录分数历史
+	if shouldRecordHistory {
+		history := &models.CreditScoreHistory{
+			UserID:    user.ID,
+			Score:     score.Score,
+			Tier:      score.Tier,
+			EventType: eventType,
+		}
+		// 忽略历史记录错误，不影响主流程
+		_ = e.creditRepo.AddScoreHistory(ctx, history)
 	}
 
 	// 保存各项因子

@@ -17,6 +17,7 @@ type CreditHandler struct {
 	creditEngine  *credit.Engine
 	signerService *signer.Service
 	creditRepo    *repository.CreditRepository
+	userRepo      *repository.UserRepository
 }
 
 // NewCreditHandler creates a new credit handler
@@ -24,11 +25,13 @@ func NewCreditHandler(
 	creditEngine *credit.Engine,
 	signerService *signer.Service,
 	creditRepo *repository.CreditRepository,
+	userRepo *repository.UserRepository,
 ) *CreditHandler {
 	return &CreditHandler{
 		creditEngine:  creditEngine,
 		signerService: signerService,
 		creditRepo:    creditRepo,
+		userRepo:      userRepo,
 	}
 }
 
@@ -146,7 +149,7 @@ func (h *CreditHandler) GetCredit(c *gin.Context) {
 		return
 	}
 
-	// Save the calculated score
+	// Save the calculated score (this also records history if score changed)
 	if err := h.creditEngine.SaveScore(c.Request.Context(), wallet, score, factors); err != nil {
 		// Log but don't fail the request
 		c.Error(err)
@@ -173,13 +176,29 @@ func (h *CreditHandler) GetCredit(c *gin.Context) {
 		}
 	}
 
+	// Fetch credit score history
+	historyItems := []CreditHistoryItem{}
+	user, err := h.userRepo.GetByWallet(c.Request.Context(), wallet)
+	if err == nil {
+		history, err := h.creditRepo.GetScoreHistory(c.Request.Context(), user.ID, 20)
+		if err == nil {
+			for _, h := range history {
+				historyItems = append(historyItems, CreditHistoryItem{
+					Timestamp: h.CreatedAt.Unix(),
+					Score:     h.Score,
+					Event:     h.EventType,
+				})
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, CreditInfoResponse{
 		Score:     score.Score,
 		Tier:      score.Tier,
 		MaxLTV:    score.MaxLTV,
 		MaxBorrow: score.MaxBorrow,
 		Factors:   nonZeroFactors,
-		History:   []CreditHistoryItem{}, // History feature can be added in future iteration
+		History:   historyItems,
 	})
 }
 

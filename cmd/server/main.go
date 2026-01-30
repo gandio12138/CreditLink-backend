@@ -16,6 +16,7 @@ import (
 	"github.com/creditlink/backend/internal/indexer"
 	"github.com/creditlink/backend/internal/repository"
 	"github.com/creditlink/backend/internal/service/credit"
+	"github.com/creditlink/backend/internal/service/price"
 	"github.com/creditlink/backend/internal/service/signer"
 	"github.com/gin-gonic/gin"
 )
@@ -55,6 +56,12 @@ func main() {
 
 	// 初始化服务
 	creditEngine := credit.NewEngine(userRepo, creditRepo, activityRepo)
+
+	// 初始化价格服务
+	priceService := price.NewService(riskRepo)
+	if err := priceService.LoadAssets(context.Background()); err != nil {
+		log.Printf("警告: 加载资产价格数据失败: %v", err)
+	}
 
 	var signerService *signer.Service
 	if cfg.Signer.PrivateKey != "" {
@@ -110,6 +117,7 @@ func main() {
 		RiskRepo:      riskRepo,
 		CreditEngine:  creditEngine,
 		SignerService: signerService,
+		PriceService:  priceService,
 	}
 	routes.SetupRoutes(r, deps)
 
