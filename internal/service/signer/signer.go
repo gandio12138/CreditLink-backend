@@ -12,6 +12,7 @@ import (
 	"github.com/creditlink/backend/internal/models"
 	"github.com/creditlink/backend/internal/repository"
 	"github.com/creditlink/backend/internal/service/credit"
+	"github.com/creditlink/backend/internal/service/price"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/google/uuid"
@@ -23,6 +24,9 @@ var (
 	ErrRateLimitExceeded  = errors.New("请求频率超限")
 	ErrInsufficientCredit = errors.New("信用分不足")
 	ErrAmountExceedsLimit = errors.New("金额超出信用额度")
+	ErrUnsupportedMarket  = errors.New("不支持的借贷市场")
+	ErrPriceUnavailable   = errors.New("价格预言机不可用")
+	ErrInvalidAmount      = errors.New("无效的借款金额")
 )
 
 // EIP-712 类型哈希
@@ -46,8 +50,9 @@ type SignatureRequest struct {
 // SignatureResponse 表示签名响应
 type SignatureResponse struct {
 	Signature   string `json:"signature"`
+	Market      string `json:"market"`
 	LTV         int    `json:"ltv"`       // 基点
-	AmountCap   string `json:"amountCap"` // wei字符串
+	AmountCap   string `json:"amountCap"` // 目标 token raw amount
 	Nonce       uint64 `json:"nonce"`
 	Deadline    int64  `json:"deadline"`
 	CreditScore int    `json:"creditScore"`
@@ -68,6 +73,7 @@ type Service struct {
 	creditEngine  *credit.Engine
 	signatureRepo *repository.SignatureRepository
 	userRepo      *repository.UserRepository
+	priceService  *price.Service
 }
 
 // Config 签名服务配置
@@ -86,6 +92,7 @@ func NewService(
 	creditEngine *credit.Engine,
 	signatureRepo *repository.SignatureRepository,
 	userRepo *repository.UserRepository,
+	priceServices ...*price.Service,
 ) (*Service, error) {
 	if cfg.PrivateKeyHex == "" {
 		return nil, ErrInvalidPrivateKey
@@ -100,6 +107,10 @@ func NewService(
 
 	lendingPool := common.HexToAddress(cfg.LendingPoolAddr)
 
+	var priceService *price.Service
+	if len(priceServices) > 0 {
+		priceService = priceServices[0]
+	}
 	s := &Service{
 		privateKey:       privateKey,
 		chainID:          big.NewInt(cfg.ChainID),
@@ -110,6 +121,7 @@ func NewService(
 		creditEngine:     creditEngine,
 		signatureRepo:    signatureRepo,
 		userRepo:         userRepo,
+		priceService:     priceService,
 	}
 
 	s.domainSeparator = s.computeDomainSeparator()
@@ -154,25 +166,39 @@ func (s *Service) Sign(ctx context.Context, req *SignatureRequest) (*SignatureRe
 
 	// 确定授权的LTV和额度上限
 	ltv := creditScore.MaxLTV
-	amountCap, ok := new(big.Int).SetString(creditScore.MaxBorrow, 10)
+	usdAmountCap, ok := new(big.Int).SetString(creditScore.MaxBorrow, 10)
 	if !ok {
-		amountCap = big.NewInt(0)
+		return nil, fmt.Errorf("解析USD信用额度失败")
 	}
+	if req.Amount == nil || req.Amount.Sign() <= 0 {
+		return nil, ErrInvalidAmount
+	}
+	if s.priceService == nil {
+		return nil, fmt.Errorf("%w: %w", ErrPriceUnavailable, price.ErrPriceReaderUnavailable)
+	}
+	amountCap, assetInfo, err := s.priceService.ConvertUSDToTokenAmount(ctx, usdAmountCap, req.Market)
+	if err != nil {
+		if errors.Is(err, price.ErrAssetNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrUnsupportedMarket, req.Market)
+		}
+		return nil, fmt.Errorf("%w: %w", ErrPriceUnavailable, err)
+	}
+	canonicalMarket := assetInfo.Symbol
 
 	// 检查请求金额是否超出限制
-	if req.Amount != nil && req.Amount.Cmp(amountCap) > 0 {
+	if req.Amount.Cmp(amountCap) > 0 {
 		return nil, ErrAmountExceedsLimit
 	}
 
-	// 获取下一个nonce
-	nonce, err := s.getNextNonce(ctx, wallet)
+	// 在数据库中原子预留 nonce。预留后即使后续失败也不会复用。
+	nonce, err := s.signatureRepo.AllocateNonce(ctx, wallet)
 	if err != nil {
-		return nil, fmt.Errorf("获取nonce失败: %w", err)
+		return nil, fmt.Errorf("预留nonce失败: %w", err)
 	}
 
 	// 计算签名截止时间
 	deadline := time.Now().Add(s.signatureTTL).Unix()
-	marketHash := crypto.Keccak256Hash([]byte(req.Market))
+	marketHash := crypto.Keccak256Hash([]byte(canonicalMarket))
 
 	// 构建结构哈希
 	structHash := s.buildStructHash(req.User, marketHash, big.NewInt(int64(ltv)), amountCap, nonce, deadline)
@@ -203,7 +229,7 @@ func (s *Service) Sign(ctx context.Context, req *SignatureRequest) (*SignatureRe
 		RequestID:     requestID,
 		UserID:        user.ID,
 		WalletAddress: wallet,
-		Market:        req.Market,
+		Market:        canonicalMarket,
 		AuthorizedLTV: ltv,
 		AmountCap:     amountCap.String(),
 		Nonce:         nonce,
@@ -221,6 +247,7 @@ func (s *Service) Sign(ctx context.Context, req *SignatureRequest) (*SignatureRe
 
 	return &SignatureResponse{
 		Signature:   fmt.Sprintf("0x%x", sig),
+		Market:      canonicalMarket,
 		LTV:         ltv,
 		AmountCap:   amountCap.String(),
 		Nonce:       nonce,
@@ -239,7 +266,7 @@ func (s *Service) buildStructHash(user common.Address, market common.Hash, ltv, 
 	data = append(data, market.Bytes()...)
 	data = append(data, common.LeftPadBytes(ltv.Bytes(), 32)...)
 	data = append(data, common.LeftPadBytes(amountCap.Bytes(), 32)...)
-	data = append(data, common.LeftPadBytes(big.NewInt(int64(nonce)).Bytes(), 32)...)
+	data = append(data, common.LeftPadBytes(new(big.Int).SetUint64(nonce).Bytes(), 32)...)
 	data = append(data, common.LeftPadBytes(big.NewInt(deadline).Bytes(), 32)...)
 
 	return crypto.Keccak256Hash(data)
@@ -253,16 +280,6 @@ func (s *Service) buildDigest(structHash common.Hash) common.Hash {
 	data = append(data, structHash.Bytes()...)
 
 	return crypto.Keccak256Hash(data)
-}
-
-// getNextNonce 获取钱包的下一个nonce
-func (s *Service) getNextNonce(ctx context.Context, wallet string) (uint64, error) {
-	// 从签名日志获取最新的nonce
-	nonce, err := s.signatureRepo.GetLatestNonceByWallet(ctx, wallet)
-	if err != nil {
-		return 0, err
-	}
-	return nonce, nil
 }
 
 // checkRateLimits 检查请求是否超出频率限制

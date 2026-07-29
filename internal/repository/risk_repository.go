@@ -60,8 +60,32 @@ func (r *RiskRepository) GetEnabledAssets(ctx context.Context) ([]models.Current
 
 // SaveRiskParams 保存或更新风险参数
 func (r *RiskRepository) SaveRiskParams(ctx context.Context, params *models.CurrentRiskParams) error {
+	return saveRiskParams(r.db.WithContext(ctx), params)
+}
+
+// ReplaceRiskParams atomically mirrors a complete on-chain RiskRegistry snapshot.
+func (r *RiskRepository) ReplaceRiskParams(ctx context.Context, params []models.CurrentRiskParams) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		addresses := make([]string, 0, len(params))
+		for i := range params {
+			params[i].AssetAddress = strings.ToLower(params[i].AssetAddress)
+			addresses = append(addresses, params[i].AssetAddress)
+			if err := saveRiskParams(tx, &params[i]); err != nil {
+				return err
+			}
+		}
+
+		query := tx.Model(&models.CurrentRiskParams{})
+		if len(addresses) == 0 {
+			return query.Where("id > ?", 0).Delete(&models.CurrentRiskParams{}).Error
+		}
+		return query.Where("asset_address NOT IN ?", addresses).Delete(&models.CurrentRiskParams{}).Error
+	})
+}
+
+func saveRiskParams(db *gorm.DB, params *models.CurrentRiskParams) error {
 	params.AssetAddress = strings.ToLower(params.AssetAddress)
-	return r.db.WithContext(ctx).Clauses(clause.OnConflict{
+	return db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "asset_address"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"asset_symbol", "decimals", "price_oracle_address", "base_ltv",

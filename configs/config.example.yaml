@@ -26,6 +26,7 @@ chain:
   rpc_url: "https://eth-sepolia.g.alchemy.com/v2/your-api-key"
   chain_id: 11155111
   lending_pool: "0x..."  # LendingPool 合约地址
+  risk_registry: "0x..." # RiskRegistry 合约地址；后端据此自动同步资产、风险参数和 PriceOracleAdapter 地址
   start_block: 7600000   # 从合约部署后的区块开始
 
 # 签名器配置

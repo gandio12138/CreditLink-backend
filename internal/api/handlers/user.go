@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"math/big"
 	"net/http"
 	"strings"
@@ -138,7 +139,11 @@ func (h *UserHandler) GetAccount(c *gin.Context) {
 		// Calculate deposit value
 		depositAmount, _ := new(big.Int).SetString(pos.DepositAmount, 10)
 		if depositAmount != nil && depositAmount.Sign() > 0 {
-			depositUSD := h.priceService.ConvertToUSD(depositAmount, pos.AssetAddress)
+			depositUSD, err := h.priceService.ConvertToUSD(c.Request.Context(), depositAmount, pos.AssetAddress)
+			if err != nil {
+				respondPriceError(c, err)
+				return
+			}
 			totalCollateralUSD.Add(totalCollateralUSD, depositUSD)
 
 			// Apply liquidation threshold for health factor
@@ -152,7 +157,11 @@ func (h *UserHandler) GetAccount(c *gin.Context) {
 		// Calculate borrow value
 		borrowAmount, _ := new(big.Int).SetString(pos.BorrowAmount, 10)
 		if borrowAmount != nil && borrowAmount.Sign() > 0 {
-			borrowUSD := h.priceService.ConvertToUSD(borrowAmount, pos.AssetAddress)
+			borrowUSD, err := h.priceService.ConvertToUSD(c.Request.Context(), borrowAmount, pos.AssetAddress)
+			if err != nil {
+				respondPriceError(c, err)
+				return
+			}
 			totalDebtUSD.Add(totalDebtUSD, borrowUSD)
 		}
 	}
@@ -243,7 +252,11 @@ func (h *UserHandler) GetPositions(c *gin.Context) {
 
 		if p.DepositAmount != "0" {
 			depositAmount, _ := new(big.Int).SetString(p.DepositAmount, 10)
-			valueUSD := h.priceService.ConvertToUSD(depositAmount, p.AssetAddress)
+			valueUSD, err := h.priceService.ConvertToUSD(c.Request.Context(), depositAmount, p.AssetAddress)
+			if err != nil {
+				respondPriceError(c, err)
+				return
+			}
 
 			deposits = append(deposits, PositionItem{
 				Asset:    p.AssetAddress,
@@ -255,7 +268,11 @@ func (h *UserHandler) GetPositions(c *gin.Context) {
 
 		if p.BorrowAmount != "0" {
 			borrowAmount, _ := new(big.Int).SetString(p.BorrowAmount, 10)
-			valueUSD := h.priceService.ConvertToUSD(borrowAmount, p.AssetAddress)
+			valueUSD, err := h.priceService.ConvertToUSD(c.Request.Context(), borrowAmount, p.AssetAddress)
+			if err != nil {
+				respondPriceError(c, err)
+				return
+			}
 
 			borrows = append(borrows, PositionItem{
 				Asset:    p.AssetAddress,
@@ -270,6 +287,18 @@ func (h *UserHandler) GetPositions(c *gin.Context) {
 		Deposits: deposits,
 		Borrows:  borrows,
 	})
+}
+
+func respondPriceError(c *gin.Context, err error) {
+	status := http.StatusBadGateway
+	if errors.Is(err, price.ErrAssetNotFound) ||
+		errors.Is(err, price.ErrOracleNotConfigured) ||
+		errors.Is(err, price.ErrPriceReaderUnavailable) {
+		status = http.StatusServiceUnavailable
+	} else if errors.Is(err, price.ErrInvalidAmount) {
+		status = http.StatusInternalServerError
+	}
+	c.JSON(status, gin.H{"error": "价格预言机不可用"})
 }
 
 // GetActivities handles GET /api/v1/user/activities

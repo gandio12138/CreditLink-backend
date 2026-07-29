@@ -3,11 +3,14 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/creditlink/backend/internal/api/middleware"
+	"github.com/creditlink/backend/internal/service/price"
+	"github.com/creditlink/backend/internal/service/signer"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,6 +18,56 @@ import (
 
 func init() {
 	gin.SetMode(gin.TestMode)
+}
+
+func TestRespondPriceErrorStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{name: "missing asset configuration", err: price.ErrAssetNotFound, status: http.StatusServiceUnavailable},
+		{name: "missing RPC reader", err: price.ErrPriceReaderUnavailable, status: http.StatusServiceUnavailable},
+		{name: "upstream oracle call failed", err: price.ErrOracleReadFailed, status: http.StatusBadGateway},
+		{name: "invalid database amount", err: price.ErrInvalidAmount, status: http.StatusInternalServerError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(response)
+			respondPriceError(ctx, tt.err)
+			require.Equal(t, tt.status, response.Code)
+		})
+	}
+}
+
+func TestSignErrorStatus(t *testing.T) {
+	require.Equal(t, http.StatusBadRequest, signErrorStatus(signer.ErrUnsupportedMarket))
+	require.Equal(t, http.StatusBadGateway, signErrorStatus(fmt.Errorf("%w: %w", signer.ErrPriceUnavailable, price.ErrOracleReadFailed)))
+	require.Equal(t, http.StatusServiceUnavailable, signErrorStatus(fmt.Errorf("%w: %w", signer.ErrPriceUnavailable, price.ErrPriceReaderUnavailable)))
+}
+
+func TestStatsHandlerRejectsMissingPriceService(t *testing.T) {
+	response := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(response)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/v1/stats/platform", nil)
+
+	(&StatsHandler{}).GetPlatformStats(ctx)
+
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+}
+
+func TestCreditHandlerRejectsMissingSignerService(t *testing.T) {
+	response := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(response)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/credit/sign", bytes.NewBufferString(`{"market":"USDC","amount":"1"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("walletAddress", "0x1111111111111111111111111111111111111111")
+
+	(&CreditHandler{}).Sign(ctx)
+
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
 }
 
 // ==================== Auth Handler Tests ====================

@@ -64,6 +64,7 @@ func AutoMigrate(db *gorm.DB) error {
 		// 活动相关
 		&models.LoanActivity{},
 		&models.SignatureLog{},
+		&models.SignatureNonceCounter{},
 
 		// 风险相关
 		&models.CurrentRiskParams{},
@@ -96,13 +97,7 @@ func createIndexes(db *gorm.DB) error {
 		log.Printf("注意: 创建索引返回: %v", err)
 	}
 
-	// 签名日志复合索引 (wallet_address, nonce)
-	if err := db.Exec(`
-		CREATE INDEX IF NOT EXISTS idx_signature_logs_wallet_nonce
-		ON signature_logs(wallet_address, nonce)
-	`).Error; err != nil {
-		log.Printf("注意: 创建索引返回: %v", err)
-	}
+	// 签名日志的 (wallet_address, nonce) 唯一索引由 SignatureLog 模型标签维护。
 
 	// 用户持仓复合索引 (user_id, asset_address)
 	if err := db.Exec(`

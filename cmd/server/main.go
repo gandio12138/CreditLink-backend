@@ -29,6 +29,8 @@ func main() {
 	}
 
 	log.Printf("CreditLink 后端服务启动中，端口: %s...", cfg.Server.Port)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// 初始化数据库连接
 	db, err := database.Connect(&cfg.Database)
@@ -57,10 +59,28 @@ func main() {
 	// 初始化服务
 	creditEngine := credit.NewEngine(userRepo, creditRepo, activityRepo)
 
-	// 初始化价格服务
-	priceService := price.NewService(riskRepo)
-	if err := priceService.LoadAssets(context.Background()); err != nil {
-		log.Printf("警告: 加载资产价格数据失败: %v", err)
+	// 初始化价格服务。资产元数据来自数据库，价格在每次请求时从链上预言机读取。
+	var oraclePriceReader price.OraclePriceReader
+	reader, readerErr := price.NewEthereumOraclePriceReader(ctx, cfg.Chain.RPCURL)
+	if readerErr != nil {
+		log.Printf("警告: 初始化链上价格读取器失败，价格相关接口将不可用: %v", readerErr)
+	} else {
+		oraclePriceReader = reader
+	}
+	priceService := price.NewService(riskRepo, oraclePriceReader)
+	var riskRegistryReader price.RiskRegistryReader
+	if cfg.Chain.RiskRegistry == "" {
+		log.Printf("警告: 未配置 chain.risk_registry，价格相关接口将不可用")
+	} else {
+		registryReader, registryErr := price.NewEthereumRiskRegistryReader(ctx, cfg.Chain.RPCURL)
+		if registryErr != nil {
+			log.Printf("警告: 初始化 RiskRegistry 读取器失败，价格相关接口将不可用: %v", registryErr)
+		} else {
+			riskRegistryReader = registryReader
+			if err := syncPriceMetadata(ctx, riskRepo, priceService, riskRegistryReader, cfg.Chain.RiskRegistry); err != nil {
+				log.Printf("警告: 同步链上风险参数失败，价格相关接口将不可用: %v", err)
+			}
+		}
 	}
 
 	var signerService *signer.Service
@@ -77,6 +97,7 @@ func main() {
 			creditEngine,
 			signatureRepo,
 			userRepo,
+			priceService,
 		)
 		if err != nil {
 			log.Printf("警告: 初始化签名服务失败: %v", err)
@@ -128,9 +149,6 @@ func main() {
 	}
 
 	// 在后台启动索引器
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	if cfg.Chain.RPCURL != "" && cfg.Chain.LendingPool != "" {
 		idxr, err := indexer.NewIndexer(
 			&indexer.Config{
@@ -155,6 +173,23 @@ func main() {
 			}()
 			log.Println("索引器已启动")
 		}
+	}
+
+	if riskRegistryReader != nil {
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := syncPriceMetadata(ctx, riskRepo, priceService, riskRegistryReader, cfg.Chain.RiskRegistry); err != nil {
+						log.Printf("链上风险参数同步失败，价格相关接口已暂停: %v", err)
+					}
+				}
+			}
+		}()
 	}
 
 	// 在 goroutine 中启动服务器
@@ -186,4 +221,24 @@ func main() {
 	}
 
 	log.Println("服务器已退出")
+}
+
+func syncPriceMetadata(
+	ctx context.Context,
+	riskRepo *repository.RiskRepository,
+	priceService *price.Service,
+	reader price.RiskRegistryReader,
+	registryAddress string,
+) error {
+	syncCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := price.SyncRiskParams(syncCtx, riskRepo, reader, registryAddress); err != nil {
+		priceService.InvalidateAssets()
+		return err
+	}
+	if err := priceService.LoadAssets(syncCtx); err != nil {
+		priceService.InvalidateAssets()
+		return err
+	}
+	return nil
 }

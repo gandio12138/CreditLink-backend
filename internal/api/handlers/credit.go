@@ -4,9 +4,11 @@ import (
 	"errors"
 	"math/big"
 	"net/http"
+	"strconv"
 
 	"github.com/creditlink/backend/internal/repository"
 	"github.com/creditlink/backend/internal/service/credit"
+	"github.com/creditlink/backend/internal/service/price"
 	"github.com/creditlink/backend/internal/service/signer"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/gin-gonic/gin"
@@ -44,9 +46,10 @@ type SignRequest struct {
 // SignResponse represents the signature response
 type SignResponse struct {
 	Signature   string `json:"signature"`
+	Market      string `json:"market"`
 	LTV         int    `json:"ltv"`
 	AmountCap   string `json:"amountCap"`
-	Nonce       uint64 `json:"nonce"`
+	Nonce       string `json:"nonce"`
 	Deadline    int64  `json:"deadline"`
 	CreditScore int    `json:"creditScore"`
 	CreditTier  string `json:"creditTier"`
@@ -54,12 +57,12 @@ type SignResponse struct {
 
 // CreditInfoResponse represents user credit information
 type CreditInfoResponse struct {
-	Score   int                 `json:"score"`
-	Tier    string              `json:"tier"`
-	MaxLTV  int                 `json:"maxLtv"`
-	MaxBorrow string            `json:"maxBorrow"`
-	Factors []CreditFactorInfo  `json:"factors"`
-	History []CreditHistoryItem `json:"history"`
+	Score     int                 `json:"score"`
+	Tier      string              `json:"tier"`
+	MaxLTV    int                 `json:"maxLtv"`
+	MaxBorrow string              `json:"maxBorrow"`
+	Factors   []CreditFactorInfo  `json:"factors"`
+	History   []CreditHistoryItem `json:"history"`
 }
 
 type CreditFactorInfo struct {
@@ -76,6 +79,11 @@ type CreditHistoryItem struct {
 
 // Sign handles POST /api/v1/credit/sign
 func (h *CreditHandler) Sign(c *gin.Context) {
+	if h.signerService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "signing service unavailable"})
+		return
+	}
+
 	var req SignRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -109,27 +117,39 @@ func (h *CreditHandler) Sign(c *gin.Context) {
 	// Sign
 	resp, err := h.signerService.Sign(c.Request.Context(), signReq)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, signer.ErrRateLimitExceeded) {
-			status = http.StatusTooManyRequests
-		} else if errors.Is(err, signer.ErrInsufficientCredit) {
-			status = http.StatusForbidden
-		} else if errors.Is(err, signer.ErrAmountExceedsLimit) {
-			status = http.StatusBadRequest
-		}
-		c.JSON(status, gin.H{"error": err.Error()})
+		c.JSON(signErrorStatus(err), gin.H{"error": err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, SignResponse{
 		Signature:   resp.Signature,
+		Market:      resp.Market,
 		LTV:         resp.LTV,
 		AmountCap:   resp.AmountCap,
-		Nonce:       resp.Nonce,
+		Nonce:       strconv.FormatUint(resp.Nonce, 10),
 		Deadline:    resp.Deadline,
 		CreditScore: resp.CreditScore,
 		CreditTier:  resp.CreditTier,
 	})
+}
+
+func signErrorStatus(err error) int {
+	if errors.Is(err, signer.ErrRateLimitExceeded) {
+		return http.StatusTooManyRequests
+	}
+	if errors.Is(err, signer.ErrInsufficientCredit) {
+		return http.StatusForbidden
+	}
+	if errors.Is(err, signer.ErrAmountExceedsLimit) || errors.Is(err, signer.ErrUnsupportedMarket) || errors.Is(err, signer.ErrInvalidAmount) {
+		return http.StatusBadRequest
+	}
+	if errors.Is(err, signer.ErrPriceUnavailable) {
+		if errors.Is(err, price.ErrPriceReaderUnavailable) || errors.Is(err, price.ErrOracleNotConfigured) {
+			return http.StatusServiceUnavailable
+		}
+		return http.StatusBadGateway
+	}
+	return http.StatusInternalServerError
 }
 
 // GetCredit handles GET /api/v1/user/credit
@@ -225,8 +245,8 @@ func (h *CreditHandler) RefreshCredit(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"score": score.Score,
-		"tier":  score.Tier,
+		"score":   score.Score,
+		"tier":    score.Tier,
 		"message": "Credit score refreshed successfully",
 	})
 }

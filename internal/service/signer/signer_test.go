@@ -242,6 +242,38 @@ func TestBuildStructHash(t *testing.T) {
 	assert.NotEqual(t, hash, hash3)
 }
 
+func TestBuildStructHashEncodesFullUint64Nonce(t *testing.T) {
+	service, err := NewService(&Config{
+		PrivateKeyHex:    testPrivateKeyHex,
+		ChainID:          1,
+		LendingPoolAddr:  "0x1234567890123456789012345678901234567890",
+		SignatureTTL:     300,
+		RateLimitPerUser: 10,
+		RateLimitPerIP:   20,
+	}, nil, nil, nil)
+	require.NoError(t, err)
+
+	nonce := uint64(1<<63 + 7)
+	actual := service.buildStructHash(
+		common.HexToAddress("0xAbCdEf1234567890aBcDeF1234567890AbCdEf12"),
+		crypto.Keccak256Hash([]byte("USDC")),
+		big.NewInt(8000),
+		big.NewInt(1_000_000),
+		nonce,
+		1_735_689_600,
+	)
+
+	data := make([]byte, 0, 224)
+	data = append(data, CREDIT_TYPEHASH.Bytes()...)
+	data = append(data, common.LeftPadBytes(common.HexToAddress("0xAbCdEf1234567890aBcDeF1234567890AbCdEf12").Bytes(), 32)...)
+	data = append(data, crypto.Keccak256Hash([]byte("USDC")).Bytes()...)
+	data = append(data, common.LeftPadBytes(big.NewInt(8000).Bytes(), 32)...)
+	data = append(data, common.LeftPadBytes(big.NewInt(1_000_000).Bytes(), 32)...)
+	data = append(data, common.LeftPadBytes(new(big.Int).SetUint64(nonce).Bytes(), 32)...)
+	data = append(data, common.LeftPadBytes(big.NewInt(1_735_689_600).Bytes(), 32)...)
+	require.Equal(t, crypto.Keccak256Hash(data), actual)
+}
+
 // TestBuildDigest tests EIP-712 digest building
 func TestBuildDigest(t *testing.T) {
 	config := &Config{
@@ -318,11 +350,11 @@ func TestErrorTypes(t *testing.T) {
 	assert.NotNil(t, ErrInsufficientCredit)
 	assert.NotNil(t, ErrAmountExceedsLimit)
 
-	// Verify error messages
-	assert.Contains(t, ErrInvalidPrivateKey.Error(), "private key")
-	assert.Contains(t, ErrRateLimitExceeded.Error(), "rate limit")
-	assert.Contains(t, ErrInsufficientCredit.Error(), "credit")
-	assert.Contains(t, ErrAmountExceedsLimit.Error(), "amount")
+	// Verify the public error messages remain stable.
+	assert.Equal(t, "无效的私钥", ErrInvalidPrivateKey.Error())
+	assert.Equal(t, "请求频率超限", ErrRateLimitExceeded.Error())
+	assert.Equal(t, "信用分不足", ErrInsufficientCredit.Error())
+	assert.Equal(t, "金额超出信用额度", ErrAmountExceedsLimit.Error())
 }
 
 // TestConfigStruct tests Config struct
@@ -347,12 +379,12 @@ func TestConfigStruct(t *testing.T) {
 // TestChainIDVariations tests service with different chain IDs
 func TestChainIDVariations(t *testing.T) {
 	chainIDs := []int64{
-		1,     // Ethereum Mainnet
-		5,     // Goerli
+		1,        // Ethereum Mainnet
+		5,        // Goerli
 		11155111, // Sepolia
-		137,   // Polygon
-		42161, // Arbitrum
-		10,    // Optimism
+		137,      // Polygon
+		42161,    // Arbitrum
+		10,       // Optimism
 	}
 
 	for _, chainID := range chainIDs {

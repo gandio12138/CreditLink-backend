@@ -18,9 +18,9 @@ type Dependencies struct {
 	SignatureRepo *repository.SignatureRepository // 签名仓储
 	RiskRepo      *repository.RiskRepository      // 风险参数仓储
 
-	CreditEngine  *credit.Engine   // 信用评分引擎
-	SignerService *signer.Service  // 签名服务
-	PriceService  *price.Service   // 价格服务
+	CreditEngine  *credit.Engine  // 信用评分引擎
+	SignerService *signer.Service // 签名服务
+	PriceService  *price.Service  // 价格服务
 }
 
 // SetupRoutes 配置所有API路由
@@ -35,16 +35,16 @@ func SetupRoutes(r *gin.Engine, deps *Dependencies) {
 	{
 		// 认证接口 (公开)
 		authHandler := handlers.NewAuthHandler(deps.UserRepo)
-		v1.GET("/auth/nonce", authHandler.GetNonce)   // 获取登录nonce
-		v1.POST("/auth/login", authHandler.Login)     // 登录
+		v1.GET("/auth/nonce", authHandler.GetNonce) // 获取登录nonce
+		v1.POST("/auth/login", authHandler.Login)   // 登录
 
 		// 风险参数接口 (公开)
 		riskHandler := handlers.NewRiskHandler(deps.RiskRepo)
-		v1.GET("/risk/params", riskHandler.GetRiskParams)           // 获取所有风险参数
+		v1.GET("/risk/params", riskHandler.GetRiskParams)             // 获取所有风险参数
 		v1.GET("/risk/params/:asset", riskHandler.GetAssetRiskParams) // 获取特定资产风险参数
 
 		// 统计接口 (公开)
-		statsHandler := handlers.NewStatsHandler(deps.ActivityRepo, deps.UserRepo, deps.RiskRepo)
+		statsHandler := handlers.NewStatsHandler(deps.ActivityRepo, deps.UserRepo, deps.RiskRepo, deps.PriceService)
 		v1.GET("/stats/platform", statsHandler.GetPlatformStats) // 获取平台统计
 		v1.GET("/stats/markets", statsHandler.GetMarketsData)    // 获取市场数据
 
@@ -54,8 +54,8 @@ func SetupRoutes(r *gin.Engine, deps *Dependencies) {
 		{
 			// 信用相关接口
 			creditHandler := handlers.NewCreditHandler(deps.CreditEngine, deps.SignerService, deps.CreditRepo, deps.UserRepo)
-			protected.POST("/credit/sign", creditHandler.Sign)              // 请求信用借款签名
-			protected.GET("/user/credit", creditHandler.GetCredit)          // 获取用户信用信息
+			protected.POST("/credit/sign", creditHandler.Sign)                  // 请求信用借款签名
+			protected.GET("/user/credit", creditHandler.GetCredit)              // 获取用户信用信息
 			protected.POST("/user/credit/refresh", creditHandler.RefreshCredit) // 刷新信用分
 
 			// 用户相关接口

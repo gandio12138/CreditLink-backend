@@ -17,12 +17,12 @@ const BaseScore = 500
 var TierConfig = map[string]struct {
 	MinScore  int
 	LTV       int    // 基点 (10000 = 100%)
-	MaxBorrow string // wei字符串
+	MaxBorrow string // 18-decimal USD wad
 }{
-	"S": {MinScore: 900, LTV: 9500, MaxBorrow: "500000000000000000000000"},  // $500k
-	"A": {MinScore: 800, LTV: 9000, MaxBorrow: "200000000000000000000000"},  // $200k
-	"B": {MinScore: 600, LTV: 8000, MaxBorrow: "50000000000000000000000"},   // $50k
-	"C": {MinScore: 400, LTV: 7000, MaxBorrow: "10000000000000000000000"},   // $10k
+	"S": {MinScore: 900, LTV: 9500, MaxBorrow: "500000000000000000000000"}, // $500k
+	"A": {MinScore: 800, LTV: 9000, MaxBorrow: "200000000000000000000000"}, // $200k
+	"B": {MinScore: 600, LTV: 8000, MaxBorrow: "50000000000000000000000"},  // $50k
+	"C": {MinScore: 400, LTV: 7000, MaxBorrow: "10000000000000000000000"},  // $10k
 	"D": {MinScore: 0, LTV: 0, MaxBorrow: "0"},
 }
 
@@ -31,7 +31,7 @@ type CreditScore struct {
 	Score     int    `json:"score"`
 	Tier      string `json:"tier"`
 	MaxLTV    int    `json:"maxLtv"`    // 基点
-	MaxBorrow string `json:"maxBorrow"` // wei字符串
+	MaxBorrow string `json:"maxBorrow"` // 18-decimal USD wad
 }
 
 // CreditFactors 表示影响信用分的各项因子
@@ -44,10 +44,10 @@ type CreditFactors struct {
 	HealthFactorBonus  int `json:"healthFactorBonus"`  // 健康因子奖励
 
 	// 外部因子 (25%权重)
-	WalletAgeBonus  int `json:"walletAgeBonus"`  // 钱包年龄奖励
-	ActivityBonus   int `json:"activityBonus"`   // 活跃度奖励
-	DiversityBonus  int `json:"diversityBonus"`  // 资产多样性奖励
-	NetWorthBonus   int `json:"netWorthBonus"`   // 净资产奖励
+	WalletAgeBonus int `json:"walletAgeBonus"` // 钱包年龄奖励
+	ActivityBonus  int `json:"activityBonus"`  // 活跃度奖励
+	DiversityBonus int `json:"diversityBonus"` // 资产多样性奖励
+	NetWorthBonus  int `json:"netWorthBonus"`  // 净资产奖励
 
 	// 风险因子 (负分)
 	BlacklistPenalty     int `json:"blacklistPenalty"`     // 黑名单惩罚

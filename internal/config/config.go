@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -50,17 +51,18 @@ type RedisConfig struct {
 }
 
 type ChainConfig struct {
-	RPCURL      string `mapstructure:"rpc_url"`
-	ChainID     int64  `mapstructure:"chain_id"`
-	LendingPool string `mapstructure:"lending_pool"`
-	StartBlock  uint64 `mapstructure:"start_block"`
+	RPCURL       string `mapstructure:"rpc_url"`
+	ChainID      int64  `mapstructure:"chain_id"`
+	LendingPool  string `mapstructure:"lending_pool"`
+	RiskRegistry string `mapstructure:"risk_registry"`
+	StartBlock   uint64 `mapstructure:"start_block"`
 }
 
 type SignerConfig struct {
-	KeyProvider      string `mapstructure:"key_provider"`      // aws_kms, gcp_kms, local
-	PrivateKey       string `mapstructure:"private_key"`       // only for local provider (dev only)
+	KeyProvider      string `mapstructure:"key_provider"` // aws_kms, gcp_kms, local
+	PrivateKey       string `mapstructure:"private_key"`  // only for local provider (dev only)
 	KMSKeyID         string `mapstructure:"kms_key_id"`
-	SignatureTTL     int    `mapstructure:"signature_ttl"`     // seconds
+	SignatureTTL     int    `mapstructure:"signature_ttl"` // seconds
 	RateLimitPerUser int    `mapstructure:"rate_limit_per_user"`
 	RateLimitPerIP   int    `mapstructure:"rate_limit_per_ip"`
 }
@@ -72,6 +74,10 @@ func Load() (*Config, error) {
 	viper.AddConfigPath(".")
 
 	viper.AutomaticEnv()
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	if err := viper.BindEnv("chain.risk_registry", "CHAIN_RISK_REGISTRY"); err != nil {
+		return nil, err
+	}
 
 	// Set defaults
 	viper.SetDefault("server.port", "8080")

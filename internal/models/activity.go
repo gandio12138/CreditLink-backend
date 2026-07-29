@@ -28,11 +28,11 @@ type LoanActivity struct {
 	CreatedAt      time.Time  `json:"createdAt"`
 
 	// Additional data for specific action types
-	LTV           *int    `gorm:"type:int" json:"ltv,omitempty"`               // for BORROW
-	Nonce         *uint64 `json:"nonce,omitempty"`                             // for BORROW
-	Liquidator    *string `gorm:"type:varchar(42)" json:"liquidator,omitempty"` // for LIQUIDATION
-	DebtCovered   *string `gorm:"type:decimal(65,0)" json:"debtCovered,omitempty"`
-	Collateral    *string `gorm:"type:varchar(42)" json:"collateral,omitempty"`
+	LTV         *int    `gorm:"type:int" json:"ltv,omitempty"`                // for BORROW
+	Nonce       *uint64 `json:"nonce,omitempty"`                              // for BORROW
+	Liquidator  *string `gorm:"type:varchar(42)" json:"liquidator,omitempty"` // for LIQUIDATION
+	DebtCovered *string `gorm:"type:decimal(65,0)" json:"debtCovered,omitempty"`
+	Collateral  *string `gorm:"type:varchar(42)" json:"collateral,omitempty"`
 
 	// Relations
 	User *User `gorm:"foreignKey:UserID" json:"user,omitempty"`
@@ -58,11 +58,11 @@ type SignatureLog struct {
 	ID            uint            `gorm:"primaryKey" json:"id"`
 	RequestID     string          `gorm:"type:varchar(36);not null" json:"requestId"`
 	UserID        uint            `gorm:"index;not null" json:"userId"`
-	WalletAddress string          `gorm:"type:varchar(42);not null;index" json:"walletAddress"`
+	WalletAddress string          `gorm:"type:varchar(42);not null;index;uniqueIndex:uidx_signature_logs_wallet_nonce,priority:1" json:"walletAddress"`
 	Market        string          `gorm:"type:varchar(10);not null" json:"market"`
 	AuthorizedLTV int             `gorm:"not null" json:"authorizedLtv"`
 	AmountCap     string          `gorm:"type:decimal(65,0)" json:"amountCap"`
-	Nonce         uint64          `gorm:"not null;index" json:"nonce"`
+	Nonce         uint64          `gorm:"not null;index;uniqueIndex:uidx_signature_logs_wallet_nonce,priority:2" json:"nonce"`
 	Deadline      int64           `gorm:"not null" json:"deadline"`
 	Signature     string          `gorm:"type:text;not null" json:"signature"`
 	IPAddress     string          `gorm:"type:varchar(45)" json:"ipAddress"`
@@ -81,15 +81,29 @@ func (SignatureLog) TableName() string {
 	return "signature_logs"
 }
 
+// SignatureNonceCounter tracks the next nonce reserved for each wallet.
+// Gaps are intentional: once reserved, a nonce is never reused even if signing later fails.
+type SignatureNonceCounter struct {
+	WalletAddress string    `gorm:"type:varchar(42);primaryKey" json:"walletAddress"`
+	NextNonce     uint64    `gorm:"not null" json:"nextNonce"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+// TableName specifies the table name for SignatureNonceCounter.
+func (SignatureNonceCounter) TableName() string {
+	return "signature_nonce_counters"
+}
+
 // CreditScoreHistory tracks historical credit score changes
 type CreditScoreHistory struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	UserID    uint      `gorm:"index;not null" json:"userId"`
-	Score     int       `gorm:"not null" json:"score"`
-	Tier      string    `gorm:"type:varchar(2)" json:"tier"`
-	EventType string    `gorm:"type:varchar(50)" json:"eventType"` // BORROW, REPAY, LIQUIDATION, etc.
-	EventTxHash *string `gorm:"type:varchar(66)" json:"eventTxHash,omitempty"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID          uint      `gorm:"primaryKey" json:"id"`
+	UserID      uint      `gorm:"index;not null" json:"userId"`
+	Score       int       `gorm:"not null" json:"score"`
+	Tier        string    `gorm:"type:varchar(2)" json:"tier"`
+	EventType   string    `gorm:"type:varchar(50)" json:"eventType"` // BORROW, REPAY, LIQUIDATION, etc.
+	EventTxHash *string   `gorm:"type:varchar(66)" json:"eventTxHash,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
 
 	// Relations
 	User *User `gorm:"foreignKey:UserID" json:"user,omitempty"`

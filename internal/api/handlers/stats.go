@@ -3,8 +3,10 @@ package handlers
 import (
 	"math/big"
 	"net/http"
+	"strings"
 
 	"github.com/creditlink/backend/internal/repository"
+	"github.com/creditlink/backend/internal/service/price"
 	"github.com/gin-gonic/gin"
 )
 
@@ -13,6 +15,7 @@ type StatsHandler struct {
 	activityRepo *repository.ActivityRepository
 	userRepo     *repository.UserRepository
 	riskRepo     *repository.RiskRepository
+	priceService *price.Service
 }
 
 // NewStatsHandler 创建统计处理器
@@ -20,11 +23,13 @@ func NewStatsHandler(
 	activityRepo *repository.ActivityRepository,
 	userRepo *repository.UserRepository,
 	riskRepo *repository.RiskRepository,
+	priceService *price.Service,
 ) *StatsHandler {
 	return &StatsHandler{
 		activityRepo: activityRepo,
 		userRepo:     userRepo,
 		riskRepo:     riskRepo,
+		priceService: priceService,
 	}
 }
 
@@ -38,15 +43,17 @@ type PlatformStats struct {
 
 // MarketData 市场数据
 type MarketData struct {
-	Symbol         string `json:"symbol"`
-	Name           string `json:"name"`
-	TotalSupply    string `json:"totalSupply"`    // 总存款量
-	TotalBorrow    string `json:"totalBorrow"`    // 总借款量
-	SupplyAPY      string `json:"supplyAPY"`      // 存款年化收益率
-	BorrowAPR      string `json:"borrowAPR"`      // 借款年化利率
-	LTV            int    `json:"ltv"`            // 贷款价值比
-	LiquidationLTV int    `json:"liquidationLtv"` // 清算阈值
-	UtilizationRate string `json:"utilizationRate"` // 资金利用率
+	Symbol            string `json:"symbol"`
+	Name              string `json:"name"`
+	TotalSupply       string `json:"totalSupply"`       // 总存款价值 (USD)，兼容现有前端
+	TotalBorrow       string `json:"totalBorrow"`       // 总借款价值 (USD)，兼容现有前端
+	TotalSupplyAmount string `json:"totalSupplyAmount"` // 总存款 token 数量
+	TotalBorrowAmount string `json:"totalBorrowAmount"` // 总借款 token 数量
+	SupplyAPY         string `json:"supplyAPY"`         // 存款年化收益率
+	BorrowAPR         string `json:"borrowAPR"`         // 借款年化利率
+	LTV               int    `json:"ltv"`               // 贷款价值比
+	LiquidationLTV    int    `json:"liquidationLtv"`    // 清算阈值
+	UtilizationRate   string `json:"utilizationRate"`   // 资金利用率
 }
 
 // GetPlatformStats 获取平台统计数据
@@ -57,19 +64,17 @@ type MarketData struct {
 // @Success 200 {object} PlatformStats
 // @Router /stats/platform [get]
 func (h *StatsHandler) GetPlatformStats(c *gin.Context) {
+	if h.priceService == nil {
+		respondPriceError(c, price.ErrPriceReaderUnavailable)
+		return
+	}
+
 	ctx := c.Request.Context()
 
 	// 获取活跃用户数
 	activeUsers, err := h.userRepo.CountActiveUsers(ctx)
 	if err != nil {
 		activeUsers = 0
-	}
-
-	// 获取风险参数（包含资产decimals）
-	riskParams, _ := h.riskRepo.GetAllRiskParams(ctx)
-	assetDecimals := make(map[string]int)
-	for _, p := range riskParams {
-		assetDecimals[p.AssetAddress] = int(p.Decimals)
 	}
 
 	// 获取存款和借款统计
@@ -106,7 +111,11 @@ func (h *StatsHandler) GetPlatformStats(c *gin.Context) {
 		}
 		net := new(big.Int).Sub(amount, withdrawn)
 		if net.Sign() > 0 {
-			usd := convertToUSD(net, assetDecimals[asset], asset)
+			usd, err := h.priceService.ConvertToUSD(ctx, net, asset)
+			if err != nil {
+				respondPriceError(c, err)
+				return
+			}
 			totalDepositsUSD.Add(totalDepositsUSD, usd)
 		}
 	}
@@ -118,7 +127,11 @@ func (h *StatsHandler) GetPlatformStats(c *gin.Context) {
 		}
 		net := new(big.Int).Sub(amount, repaid)
 		if net.Sign() > 0 {
-			usd := convertToUSD(net, assetDecimals[asset], asset)
+			usd, err := h.priceService.ConvertToUSD(ctx, net, asset)
+			if err != nil {
+				respondPriceError(c, err)
+				return
+			}
 			totalBorrowsUSD.Add(totalBorrowsUSD, usd)
 		}
 	}
@@ -147,6 +160,10 @@ func (h *StatsHandler) GetPlatformStats(c *gin.Context) {
 // @Success 200 {array} MarketData
 // @Router /stats/markets [get]
 func (h *StatsHandler) GetMarketsData(c *gin.Context) {
+	if h.priceService == nil {
+		respondPriceError(c, price.ErrPriceReaderUnavailable)
+		return
+	}
 	ctx := c.Request.Context()
 
 	// 获取所有风险参数
@@ -157,10 +174,26 @@ func (h *StatsHandler) GetMarketsData(c *gin.Context) {
 	}
 
 	// 获取各资产的存借款统计
-	depositStats, _ := h.activityRepo.GetTotalsByActionType(ctx, "DEPOSIT")
-	borrowStats, _ := h.activityRepo.GetTotalsByActionType(ctx, "BORROW")
-	withdrawStats, _ := h.activityRepo.GetTotalsByActionType(ctx, "WITHDRAW")
-	repayStats, _ := h.activityRepo.GetTotalsByActionType(ctx, "REPAY")
+	depositStats, err := h.activityRepo.GetTotalsByActionType(ctx, "DEPOSIT")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取存款统计失败"})
+		return
+	}
+	borrowStats, err := h.activityRepo.GetTotalsByActionType(ctx, "BORROW")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取借款统计失败"})
+		return
+	}
+	withdrawStats, err := h.activityRepo.GetTotalsByActionType(ctx, "WITHDRAW")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取提款统计失败"})
+		return
+	}
+	repayStats, err := h.activityRepo.GetTotalsByActionType(ctx, "REPAY")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取还款统计失败"})
+		return
+	}
 
 	markets := make([]MarketData, 0, len(riskParams))
 
@@ -192,6 +225,12 @@ func (h *StatsHandler) GetMarketsData(c *gin.Context) {
 			netBorrow = big.NewInt(0)
 		}
 
+		usdValues, err := h.priceService.ConvertToUSDValues(ctx, params.AssetAddress, netDeposit, netBorrow)
+		if err != nil {
+			respondPriceError(c, err)
+			return
+		}
+
 		// 计算资金利用率
 		utilizationRate := "0"
 		if netDeposit.Sign() > 0 {
@@ -204,57 +243,21 @@ func (h *StatsHandler) GetMarketsData(c *gin.Context) {
 		supplyAPY, borrowAPR := calculateRates(utilizationRate)
 
 		markets = append(markets, MarketData{
-			Symbol:          params.AssetSymbol,
-			Name:            getAssetName(params.AssetSymbol),
-			TotalSupply:     formatTokenAmount(netDeposit, int(params.Decimals)),
-			TotalBorrow:     formatTokenAmount(netBorrow, int(params.Decimals)),
-			SupplyAPY:       supplyAPY,
-			BorrowAPR:       borrowAPR,
-			LTV:             params.BaseLTV,
-			LiquidationLTV:  params.LiquidationThreshold,
-			UtilizationRate: utilizationRate,
+			Symbol:            params.AssetSymbol,
+			Name:              getAssetName(params.AssetSymbol),
+			TotalSupply:       formatUSDFloat(usdValues[0]),
+			TotalBorrow:       formatUSDFloat(usdValues[1]),
+			TotalSupplyAmount: formatTokenAmount(netDeposit, int(params.Decimals)),
+			TotalBorrowAmount: formatTokenAmount(netBorrow, int(params.Decimals)),
+			SupplyAPY:         supplyAPY,
+			BorrowAPR:         borrowAPR,
+			LTV:               params.BaseLTV,
+			LiquidationLTV:    params.LiquidationThreshold,
+			UtilizationRate:   utilizationRate,
 		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{"markets": markets})
-}
-
-// 辅助函数：将资产数量转换为 USD
-// 使用简化的价格假设：USDT/USDC=$1, WETH=$2500, WBTC=$45000
-func convertToUSD(amount *big.Int, decimals int, assetAddress string) *big.Float {
-	if amount == nil || amount.Sign() == 0 || decimals == 0 {
-		return big.NewFloat(0)
-	}
-
-	// 获取资产价格 (简化：从地址推断资产类型)
-	price := 1.0
-	// 根据地址前缀判断资产类型（简化处理）
-	if len(assetAddress) > 3 {
-		prefix := assetAddress[2:3] // 0x后的第一个字符
-		switch prefix {
-		case "3": // WETH
-			price = 2500.0
-		case "4": // WBTC
-			price = 45000.0
-		default: // USDT, USDC
-			price = 1.0
-		}
-	}
-
-	// 计算: (amount / 10^decimals) * price
-	amountFloat := new(big.Float).SetInt(amount)
-	divisor := new(big.Float).SetFloat64(float64(pow10(decimals)))
-	normalized := new(big.Float).Quo(amountFloat, divisor)
-	return new(big.Float).Mul(normalized, big.NewFloat(price))
-}
-
-// 辅助函数：计算10的n次方
-func pow10(n int) int64 {
-	result := int64(1)
-	for i := 0; i < n; i++ {
-		result *= 10
-	}
-	return result
 }
 
 // 辅助函数：格式化 big.Float 为 USD 字符串
@@ -262,8 +265,7 @@ func formatUSDFloat(amount *big.Float) string {
 	if amount == nil || amount.Sign() == 0 {
 		return "0"
 	}
-	f, _ := amount.Float64()
-	return big.NewFloat(f).Text('f', 2)
+	return amount.Text('f', 2)
 }
 
 // 辅助函数：格式化为 USD 字符串 (遗留函数)
@@ -283,8 +285,15 @@ func formatTokenAmount(amount *big.Int, decimals int) string {
 		return "0"
 	}
 	divisor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
-	result := new(big.Int).Div(amount, divisor)
-	return result.String()
+	integer, remainder := new(big.Int), new(big.Int)
+	integer.QuoRem(amount, divisor, remainder)
+	if remainder.Sign() == 0 {
+		return integer.String()
+	}
+	fractionDigits := remainder.String()
+	fraction := strings.Repeat("0", decimals-len(fractionDigits)) + fractionDigits
+	fraction = strings.TrimRight(fraction, "0")
+	return integer.String() + "." + fraction
 }
 
 // 辅助函数：格式化百分比

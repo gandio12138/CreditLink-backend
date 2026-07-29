@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 var (
 	ErrSignatureNotFound = errors.New("签名记录不存在")
+	ErrNonceAllocation   = errors.New("nonce 分配失败")
 )
 
 // SignatureRepository 签名日志数据仓库
@@ -57,20 +59,46 @@ func (r *SignatureRepository) GetByWalletAndNonce(ctx context.Context, wallet st
 	return &log, nil
 }
 
-// GetLatestNonceByWallet 获取钱包的最新nonce
-func (r *SignatureRepository) GetLatestNonceByWallet(ctx context.Context, wallet string) (uint64, error) {
-	var log models.SignatureLog
+// AllocateNonce 为钱包原子预留一个 nonce。
+// 首次分配会从历史签名日志的最大 nonce 继续，之后由计数器单调递增。
+func (r *SignatureRepository) AllocateNonce(ctx context.Context, wallet string) (uint64, error) {
 	wallet = strings.ToLower(wallet)
-	if err := r.db.WithContext(ctx).
-		Where("wallet_address = ?", wallet).
-		Order("nonce DESC").
-		First(&log).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return 0, nil // 还没有签名，nonce从0开始
-		}
-		return 0, err
+
+	var allocation struct {
+		Nonce uint64 `gorm:"column:nonce"`
 	}
-	return log.Nonce + 1, nil // 返回下一个预期的nonce
+
+	result := r.db.WithContext(ctx).Raw(`
+		INSERT INTO signature_nonce_counters (
+			wallet_address,
+			next_nonce,
+			created_at,
+			updated_at
+		)
+		SELECT
+			?,
+			COALESCE(MAX(nonce), -1) + 2,
+			CURRENT_TIMESTAMP,
+			CURRENT_TIMESTAMP
+		FROM signature_logs
+		WHERE LOWER(wallet_address) = ?
+		ON CONFLICT (wallet_address) DO UPDATE SET
+			next_nonce = CASE
+				WHEN signature_nonce_counters.next_nonce + 1 > excluded.next_nonce
+					THEN signature_nonce_counters.next_nonce + 1
+				ELSE excluded.next_nonce
+			END,
+			updated_at = CURRENT_TIMESTAMP
+		RETURNING next_nonce - 1 AS nonce
+	`, wallet, wallet).Scan(&allocation)
+	if result.Error != nil {
+		return 0, fmt.Errorf("%w: %v", ErrNonceAllocation, result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return 0, ErrNonceAllocation
+	}
+
+	return allocation.Nonce, nil
 }
 
 // MarkAsUsed 标记签名已使用

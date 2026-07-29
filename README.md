@@ -86,10 +86,17 @@ jwt:
   secret: your-jwt-secret
   expire: 24h
 
-ethereum:
+chain:
   rpc_url: https://eth-sepolia.g.alchemy.com/v2/your-api-key
   chain_id: 11155111
+  lending_pool: "0x..."
+  risk_registry: "0x..."
 ```
+
+后端启动时会从 `RiskRegistry` 的 `getAssetsList()` 和
+`getRiskParams(asset)` 自动同步 `current_risk_params`，运行期间每 30 秒刷新一次。
+价格由风险参数中的 `PriceOracleAdapter` 地址实时读取；同步或链上读取失败时，
+USD 估值接口会返回错误，不会回退到固定价格。
 
 ## API 端点
 

@@ -2,6 +2,9 @@ package repository
 
 import (
 	"context"
+	"fmt"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,12 +30,18 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		&models.CreditFactor{},
 		&models.LoanActivity{},
 		&models.SignatureLog{},
+		&models.SignatureNonceCounter{},
 		&models.CurrentRiskParams{},
 		&models.RiskParamsHistory{},
 		&models.IndexerState{},
 		&models.UserPosition{},
 	)
 	require.NoError(t, err)
+
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	// SQLite :memory: 数据库只对单连接可见；同时也让并发单测稳定地验证数据库原子分配语句。
+	sqlDB.SetMaxOpenConns(1)
 
 	return db
 }
@@ -535,44 +544,156 @@ func TestSignatureRepository_Create(t *testing.T) {
 	assert.NotZero(t, signatureLog.ID)
 }
 
-func TestSignatureRepository_GetLatestNonceByWallet(t *testing.T) {
+func TestSignatureRepository_AllocateNonce(t *testing.T) {
 	db := setupTestDB(t)
 	userRepo := NewUserRepository(db)
 	sigRepo := NewSignatureRepository(db)
 	ctx := context.Background()
 
-	// Create a test user
-	user := &models.User{WalletAddress: "0x1234567890123456789012345678901234567890"}
-	err := userRepo.Create(ctx, user)
-	require.NoError(t, err)
+	t.Run("new wallet starts from zero and normalizes address", func(t *testing.T) {
+		walletUpper := "0xABCDEF1234567890ABCDEF1234567890ABCDEF12"
 
-	t.Run("No signatures", func(t *testing.T) {
-		nonce, err := sigRepo.GetLatestNonceByWallet(ctx, user.WalletAddress)
-		assert.NoError(t, err)
-		assert.Equal(t, uint64(0), nonce) // No signatures yet, returns 0
+		first, err := sigRepo.AllocateNonce(ctx, walletUpper)
+		require.NoError(t, err)
+		second, err := sigRepo.AllocateNonce(ctx, "0xabcdef1234567890abcdef1234567890abcdef12")
+		require.NoError(t, err)
+
+		assert.Equal(t, uint64(0), first)
+		assert.Equal(t, uint64(1), second)
 	})
 
-	t.Run("With signatures", func(t *testing.T) {
-		// Create signatures with different nonces
-		for i := uint64(1); i <= 5; i++ {
-			sig := &models.SignatureLog{
-				RequestID:     "uuid-" + string(rune('0'+i)),
+	t.Run("existing signature logs seed the counter", func(t *testing.T) {
+		user := &models.User{WalletAddress: "0x1234567890123456789012345678901234567890"}
+		require.NoError(t, userRepo.Create(ctx, user))
+
+		for _, nonce := range []uint64{0, 3, 5} {
+			require.NoError(t, sigRepo.Create(ctx, &models.SignatureLog{
+				RequestID:     fmt.Sprintf("seed-%d", nonce),
 				UserID:        user.ID,
 				WalletAddress: user.WalletAddress,
 				Market:        "USDT",
-				Nonce:         i,
+				Nonce:         nonce,
 				Deadline:      time.Now().Add(5 * time.Minute).Unix(),
-				Signature:     "0xsig" + string(rune('0'+i)),
+				Signature:     fmt.Sprintf("0xseed%d", nonce),
 				Status:        models.SignatureIssued,
-			}
-			err := sigRepo.Create(ctx, sig)
+			}))
+		}
+
+		nonce, err := sigRepo.AllocateNonce(ctx, user.WalletAddress)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(6), nonce)
+	})
+
+	t.Run("legacy mixed-case wallet seeds the normalized counter", func(t *testing.T) {
+		walletLower := "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+		user := &models.User{WalletAddress: walletLower}
+		require.NoError(t, userRepo.Create(ctx, user))
+
+		// 绕过 repository.Create 模拟历史大小写不一致数据。
+		require.NoError(t, db.Create(&models.SignatureLog{
+			RequestID:     "legacy-mixed-case",
+			UserID:        user.ID,
+			WalletAddress: "0xABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD",
+			Market:        "USDT",
+			Nonce:         8,
+			Deadline:      time.Now().Add(5 * time.Minute).Unix(),
+			Signature:     "0xlegacy",
+			Status:        models.SignatureIssued,
+		}).Error)
+
+		nonce, err := sigRepo.AllocateNonce(ctx, walletLower)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(9), nonce)
+	})
+
+	t.Run("counter catches up with a higher legacy nonce", func(t *testing.T) {
+		wallet := "0x8888888888888888888888888888888888888888"
+		first, err := sigRepo.AllocateNonce(ctx, wallet)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(0), first)
+
+		user := &models.User{WalletAddress: wallet}
+		require.NoError(t, userRepo.Create(ctx, user))
+		require.NoError(t, sigRepo.Create(ctx, &models.SignatureLog{
+			RequestID:     "legacy-higher-nonce",
+			UserID:        user.ID,
+			WalletAddress: wallet,
+			Market:        "USDT",
+			Nonce:         10,
+			Deadline:      time.Now().Add(5 * time.Minute).Unix(),
+			Signature:     "0xlegacy",
+			Status:        models.SignatureIssued,
+		}))
+
+		next, err := sigRepo.AllocateNonce(ctx, wallet)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(11), next)
+	})
+
+	t.Run("concurrent allocations are unique", func(t *testing.T) {
+		const workers = 32
+		wallet := "0x9999999999999999999999999999999999999999"
+		nonces := make(chan uint64, workers)
+		errs := make(chan error, workers)
+		var wg sync.WaitGroup
+
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				nonce, err := sigRepo.AllocateNonce(ctx, wallet)
+				if err != nil {
+					errs <- err
+					return
+				}
+				nonces <- nonce
+			}()
+		}
+
+		wg.Wait()
+		close(nonces)
+		close(errs)
+
+		for err := range errs {
 			require.NoError(t, err)
 		}
 
-		nonce, err := sigRepo.GetLatestNonceByWallet(ctx, user.WalletAddress)
-		assert.NoError(t, err)
-		assert.Equal(t, uint64(6), nonce) // Next nonce should be 6
+		allocated := make([]uint64, 0, workers)
+		for nonce := range nonces {
+			allocated = append(allocated, nonce)
+		}
+		sort.Slice(allocated, func(i, j int) bool { return allocated[i] < allocated[j] })
+		require.Len(t, allocated, workers)
+		for i, nonce := range allocated {
+			assert.Equal(t, uint64(i), nonce)
+		}
 	})
+}
+
+func TestSignatureRepository_CreateRejectsDuplicateWalletNonce(t *testing.T) {
+	db := setupTestDB(t)
+	userRepo := NewUserRepository(db)
+	sigRepo := NewSignatureRepository(db)
+	ctx := context.Background()
+
+	user := &models.User{WalletAddress: "0x7777777777777777777777777777777777777777"}
+	require.NoError(t, userRepo.Create(ctx, user))
+
+	newLog := func(requestID string) *models.SignatureLog {
+		return &models.SignatureLog{
+			RequestID:     requestID,
+			UserID:        user.ID,
+			WalletAddress: user.WalletAddress,
+			Market:        "USDT",
+			Nonce:         9,
+			Deadline:      time.Now().Add(5 * time.Minute).Unix(),
+			Signature:     "0xsig",
+			Status:        models.SignatureIssued,
+		}
+	}
+
+	require.NoError(t, sigRepo.Create(ctx, newLog("first")))
+	assert.Error(t, sigRepo.Create(ctx, newLog("duplicate")))
 }
 
 func TestSignatureRepository_MarkAsUsed(t *testing.T) {
@@ -661,9 +782,9 @@ func TestErrorTypes(t *testing.T) {
 	assert.NotNil(t, ErrActivityNotFound)
 	assert.NotNil(t, ErrSignatureNotFound)
 
-	// Verify error messages are meaningful
-	assert.Contains(t, ErrUserNotFound.Error(), "user")
-	assert.Contains(t, ErrCreditNotFound.Error(), "credit")
+	// Verify the public error messages remain stable.
+	assert.Equal(t, "用户不存在", ErrUserNotFound.Error())
+	assert.Equal(t, "信用记录不存在", ErrCreditNotFound.Error())
 }
 
 // ==================== Boundary Condition Tests ====================
